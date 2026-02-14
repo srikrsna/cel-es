@@ -22,6 +22,7 @@ import type {
   Expr_Call,
   Expr_Select,
   Expr_CreateStruct,
+  Expr_Comprehension,
   ConstantSchema,
 } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
 import {
@@ -93,6 +94,8 @@ export class Checker {
         return this.checkSelectExpr(expr.id, expr.exprKind.value);
       case "structExpr":
         return this.checkStructExpr(expr.id, expr.exprKind.value);
+      case "comprehensionExpr":
+        return this.checkComprehensionExpr(expr.id, expr.exprKind.value);
       default:
         throw new Error(`Unsupported expression kind: ${expr.exprKind.case}`);
     }
@@ -606,6 +609,144 @@ export class Checker {
         },
       },
     };
+  }
+
+  private checkComprehensionExpr(
+    id: bigint,
+    comp: Expr_Comprehension,
+  ): MessageInitShape<typeof ExprSchema> {
+    // Check the iteration range to determine what we're iterating over
+    if (!comp.iterRange) {
+      throw celError("comprehension missing iterRange", id);
+    }
+
+    const iterRange = this.checkExpr(comp.iterRange);
+    const iterRangeType = this.getExprType(comp.iterRange.id);
+
+    // Determine iteration variable types based on the range type
+    let iterVarType: CelType;
+    let iterVar2Type: CelType | undefined = undefined;
+
+    switch (iterRangeType.kind) {
+      case "list": {
+        // List iteration: iter_var gets element type, iter_var2 gets index (int)
+        iterVarType = iterRangeType.element;
+        if (comp.iterVar2) {
+          iterVar2Type = CelScalar.INT;
+        }
+        break;
+      }
+
+      case "map": {
+        // Map iteration: iter_var gets key type, iter_var2 gets value type
+        iterVarType = iterRangeType.key;
+        if (comp.iterVar2) {
+          iterVar2Type = iterRangeType.value;
+        }
+        break;
+      }
+
+      case "scalar": {
+        if (iterRangeType.name === "dyn") {
+          // DYN type: both variables get DYN
+          iterVarType = CelScalar.DYN;
+          if (comp.iterVar2) {
+            iterVar2Type = CelScalar.DYN;
+          }
+        } else {
+          throw celError(
+            `cannot iterate over scalar type '${iterRangeType.name}'`,
+            id,
+          );
+        }
+        break;
+      }
+
+      default:
+        throw celError(`cannot iterate over this type`, id);
+    }
+
+    // Create scope with iteration variables
+    const scopeVars: Record<string, CelType> = {
+      [comp.iterVar]: iterVarType,
+    };
+    if (comp.iterVar2 && iterVar2Type) {
+      scopeVars[comp.iterVar2] = iterVar2Type;
+    }
+
+    // Also add accumulator variable to scope
+    if (comp.accuVar) {
+      // Check accumulator init to get its type
+      if (comp.accuInit) {
+        const accuInit = this.checkExpr(comp.accuInit);
+        const accuInitType = this.getExprType(comp.accuInit.id);
+        scopeVars[comp.accuVar] = accuInitType;
+      } else {
+        scopeVars[comp.accuVar] = CelScalar.DYN;
+      }
+    }
+
+    // Push scope
+    const previousScope = this.scope;
+    this.scope = this.scope.push(scopeVars);
+
+    try {
+      // Check loop condition if present
+      let loopCondition: MessageInitShape<typeof ExprSchema> | undefined =
+        undefined;
+      if (comp.loopCondition) {
+        loopCondition = this.checkExpr(comp.loopCondition);
+        const condType = this.getExprType(comp.loopCondition.id);
+        // Condition should be bool, but we don't error if it's DYN
+        if (
+          condType.kind === "scalar" &&
+          condType.name !== "bool" &&
+          condType.name !== "dyn"
+        ) {
+          throw celError(
+            `loop condition must be bool, got ${condType.name}`,
+            comp.loopCondition.id,
+          );
+        }
+      }
+
+      // Check loop step if present
+      let loopStep: MessageInitShape<typeof ExprSchema> | undefined = undefined;
+      if (comp.loopStep) {
+        loopStep = this.checkExpr(comp.loopStep);
+      }
+
+      // Check result expression
+      let result: MessageInitShape<typeof ExprSchema> | undefined = undefined;
+      let resultType: CelType = CelScalar.DYN;
+      if (comp.result) {
+        result = this.checkExpr(comp.result);
+        resultType = this.getExprType(comp.result.id);
+      }
+
+      // Set the result type
+      this.setType(id, resultType);
+
+      return {
+        id,
+        exprKind: {
+          case: "comprehensionExpr",
+          value: {
+            iterVar: comp.iterVar,
+            iterVar2: comp.iterVar2,
+            iterRange,
+            accuVar: comp.accuVar,
+            accuInit: comp.accuInit ? this.checkExpr(comp.accuInit) : undefined,
+            loopCondition,
+            loopStep,
+            result,
+          },
+        },
+      };
+    } finally {
+      // Pop scope
+      this.scope = previousScope;
+    }
   }
 
   /**
