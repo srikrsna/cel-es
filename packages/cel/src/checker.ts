@@ -20,6 +20,7 @@ import type {
   Expr_Ident,
   Expr_CreateList,
   Expr_Call,
+  Expr_Select,
   ConstantSchema,
 } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
 import {
@@ -30,7 +31,7 @@ import {
   type TypeSchema,
   Type_PrimitiveType,
 } from "@bufbuild/cel-spec/cel/expr/checked_pb.js";
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape, ScalarType } from "@bufbuild/protobuf";
 import {
   CelScalar,
   celType,
@@ -87,6 +88,8 @@ export class Checker {
         return this.checkListExpr(expr.id, expr.exprKind.value);
       case "callExpr":
         return this.checkCallExpr(expr.id, expr.exprKind.value);
+      case "selectExpr":
+        return this.checkSelectExpr(expr.id, expr.exprKind.value);
       default:
         throw new Error(`Unsupported expression kind: ${expr.exprKind.case}`);
     }
@@ -318,6 +321,186 @@ export class Checker {
       return true;
     }
     return equalsType(expected, actual);
+  }
+
+  private checkSelectExpr(
+    id: bigint,
+    select: Expr_Select,
+  ): MessageInitShape<typeof ExprSchema> {
+    if (!select.operand) {
+      throw celError("select expression missing operand", id);
+    }
+
+    // Check the operand
+    const operand = this.checkExpr(select.operand);
+    const operandType = this.getExprType(select.operand.id);
+
+    // If test_only is true, this is a has() presence test - result is always bool
+    if (select.testOnly) {
+      this.setType(id, CelScalar.BOOL);
+      return {
+        id,
+        exprKind: {
+          case: "selectExpr",
+          value: {
+            operand,
+            field: select.field,
+            testOnly: true,
+          },
+        },
+      };
+    }
+
+    // Determine the result type based on the operand type
+    let resultType: CelType;
+
+    switch (operandType.kind) {
+      case "object": {
+        // Proto message field access
+        if (!operandType.desc) {
+          throw celError(`cannot access field on undefined object type`, id);
+        }
+        const field = operandType.desc.fields.find(
+          (f) => f.name === select.field,
+        );
+        if (!field) {
+          throw celError(
+            `field '${select.field}' not found on type '${operandType.desc.typeName}'`,
+            id,
+          );
+        }
+        resultType = this.descFieldToCelType(field);
+        break;
+      }
+
+      case "map": {
+        // Map field access returns the value type
+        resultType = operandType.value;
+        break;
+      }
+
+      case "scalar": {
+        if (operandType.name === "dyn") {
+          // DYN type - allow any field access, result is DYN
+          resultType = CelScalar.DYN;
+        } else {
+          throw celError(
+            `field access not supported on scalar type '${operandType.name}'`,
+            id,
+          );
+        }
+        break;
+      }
+
+      case "list": {
+        throw celError(`field access not supported on list type`, id);
+      }
+
+      default:
+        throw celError(`unsupported operand type for field access`, id);
+    }
+
+    this.setType(id, resultType);
+
+    return {
+      id,
+      exprKind: {
+        case: "selectExpr",
+        value: {
+          operand,
+          field: select.field,
+          testOnly: false,
+        },
+      },
+    };
+  }
+
+  /**
+   * Convert a protobuf field descriptor to a CEL type.
+   */
+  private descFieldToCelType(
+    field: import("@bufbuild/protobuf").DescField,
+  ): CelType {
+    switch (field.fieldKind) {
+      case "scalar": {
+        // Map protobuf scalar types to CEL types
+        return this.scalarToCelType(field.scalar);
+      }
+
+      case "enum":
+        // Enums are represented as int in CEL
+        return CelScalar.INT;
+
+      case "message":
+        // Message types become object types
+        return objectType(field.message);
+
+      case "list": {
+        // List fields - get element type based on listKind
+        switch (field.listKind) {
+          case "scalar":
+            return listType(this.scalarToCelType(field.scalar));
+          case "enum":
+            return listType(CelScalar.INT);
+          case "message":
+            return listType(objectType(field.message));
+        }
+        break;
+      }
+
+      case "map": {
+        // Map fields - get key and value types
+        // Key is always a scalar (and must be a valid map key type)
+        const keyType = this.scalarToCelType(field.mapKey) as mapKeyType;
+
+        // Value type depends on mapKind
+        let valueType: CelType;
+        switch (field.mapKind) {
+          case "scalar":
+            valueType = this.scalarToCelType(field.scalar);
+            break;
+          case "enum":
+            valueType = CelScalar.INT;
+            break;
+          case "message":
+            valueType = objectType(field.message);
+            break;
+        }
+
+        return mapType(keyType, valueType);
+      }
+    }
+  }
+
+  /**
+   * Helper to convert protobuf scalar type to CEL type.
+   */
+  private scalarToCelType(scalar: ScalarType): CelType {
+    switch (scalar) {
+      case ScalarType.DOUBLE:
+      case ScalarType.FLOAT:
+        return CelScalar.DOUBLE;
+      case ScalarType.INT64:
+      case ScalarType.INT32:
+      case ScalarType.SINT32:
+      case ScalarType.SINT64:
+      case ScalarType.SFIXED32:
+      case ScalarType.SFIXED64:
+        return CelScalar.INT;
+      case ScalarType.UINT64:
+      case ScalarType.UINT32:
+      case ScalarType.FIXED32:
+      case ScalarType.FIXED64:
+        return CelScalar.UINT;
+      case ScalarType.BOOL:
+        return CelScalar.BOOL;
+      case ScalarType.STRING:
+        return CelScalar.STRING;
+      case ScalarType.BYTES:
+        return CelScalar.BYTES;
+      default:
+        throw new Error(`unknown scalar type: ${scalar}`);
+    }
   }
 
   private setType(id: bigint, type: CelType): void {
