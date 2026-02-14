@@ -18,6 +18,7 @@ import type {
   Expr,
   SourceInfo,
   Expr_Ident,
+  Expr_CreateList,
   ConstantSchema,
 } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
 import {
@@ -41,6 +42,7 @@ import {
   objectType,
   TIMESTAMP,
 } from "./type.js";
+import { equalsType } from "./equals.js";
 import { NullValue } from "@bufbuild/protobuf/wkt";
 import type { CelEnv } from "./env.js";
 import { resolveCandidateNames } from "./namespace.js";
@@ -79,6 +81,8 @@ export class Checker {
         return this.checkConstExpr(expr.id, expr.exprKind.value);
       case "identExpr":
         return this.checkIdentExpr(expr.id, expr.exprKind.value);
+      case "listExpr":
+        return this.checkListExpr(expr.id, expr.exprKind.value);
       default:
         throw new Error(`Unsupported expression kind: ${expr.exprKind.case}`);
     }
@@ -149,6 +153,37 @@ export class Checker {
         case: "identExpr",
         value: {
           name: variable.name,
+        },
+      },
+    };
+  }
+
+  private checkListExpr(
+    id: bigint,
+    listExpr: Expr_CreateList,
+  ): MessageInitShape<typeof ExprSchema> {
+    const elements: MessageInitShape<typeof ExprSchema>[] = [];
+    let listElemType: CelType | undefined = undefined;
+    for (const elem of listExpr.elements) {
+      elements.push(this.checkExpr(elem));
+      const elemType = this.typeMap.get(elem.id);
+      if (!elemType) {
+        throw celError(`element has no type`, elem.id);
+      }
+      if (listElemType === undefined) {
+        listElemType = elemType;
+      } else if (!equalsType(listElemType, elemType)) {
+        listElemType = CelScalar.DYN;
+      }
+    }
+    this.setType(id, listType(listElemType ?? CelScalar.DYN));
+    return {
+      id,
+      exprKind: {
+        case: "listExpr",
+        value: {
+          elements,
+          optionalIndices: listExpr.optionalIndices,
         },
       },
     };
