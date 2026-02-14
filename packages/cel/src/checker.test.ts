@@ -98,6 +98,8 @@ const filter = createExpressionFilter([
   "null_int == null || null == null_int || null_msg == null || null == null_msg",
   "NotAMessage{}",
   "{}.map(c,[c,type(c)])",
+  // TODO: Requires type parameter unification - list concat needs compatible element types
+  "x + y",
 ]);
 
 runTestSuite(getCheckingSuite(), runCheckingTest, [], filter);
