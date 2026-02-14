@@ -21,6 +21,7 @@ import type {
   Expr_CreateList,
   Expr_Call,
   Expr_Select,
+  Expr_CreateStruct,
   ConstantSchema,
 } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
 import {
@@ -90,6 +91,8 @@ export class Checker {
         return this.checkCallExpr(expr.id, expr.exprKind.value);
       case "selectExpr":
         return this.checkSelectExpr(expr.id, expr.exprKind.value);
+      case "structExpr":
+        return this.checkStructExpr(expr.id, expr.exprKind.value);
       default:
         throw new Error(`Unsupported expression kind: ${expr.exprKind.case}`);
     }
@@ -410,6 +413,196 @@ export class Checker {
           operand,
           field: select.field,
           testOnly: false,
+        },
+      },
+    };
+  }
+
+  private checkStructExpr(
+    id: bigint,
+    struct: Expr_CreateStruct,
+  ): MessageInitShape<typeof ExprSchema> {
+    // Distinguish between map literals and message literals
+    if (struct.messageName === "") {
+      // Map literal: {key: value, ...}
+      return this.checkMapLiteral(id, struct);
+    }
+    // Message/struct literal: TypeName{field: value, ...}
+    return this.checkMessageLiteral(id, struct);
+  }
+
+  private checkMapLiteral(
+    id: bigint,
+    struct: Expr_CreateStruct,
+  ): MessageInitShape<typeof ExprSchema> {
+    const entries: MessageInitShape<
+      typeof ExprSchema
+    >["exprKind"]["value"]["entries"] = [];
+    let keyType: CelType | undefined = undefined;
+    let valueType: CelType | undefined = undefined;
+
+    for (const entry of struct.entries) {
+      if (!entry.keyKind || entry.keyKind.case !== "mapKey") {
+        throw celError(`map entry must have mapKey, not fieldKey`, entry.id);
+      }
+
+      // Check key expression
+      const keyExpr = this.checkExpr(entry.keyKind.value);
+      const entryKeyType = this.getExprType(entry.keyKind.value.id);
+
+      // Check value expression
+      if (!entry.value) {
+        throw celError(`map entry missing value`, entry.id);
+      }
+      const valueExpr = this.checkExpr(entry.value);
+      const entryValueType = this.getExprType(entry.value.id);
+
+      // Join types - if different types seen, result becomes DYN
+      if (keyType === undefined) {
+        keyType = entryKeyType;
+      } else if (!equalsType(keyType, entryKeyType)) {
+        keyType = CelScalar.DYN;
+      }
+
+      if (valueType === undefined) {
+        valueType = entryValueType;
+      } else if (!equalsType(valueType, entryValueType)) {
+        valueType = CelScalar.DYN;
+      }
+
+      entries.push({
+        id: entry.id,
+        keyKind: {
+          case: "mapKey",
+          value: keyExpr,
+        },
+        value: valueExpr,
+        optionalEntry: entry.optionalEntry,
+      });
+    }
+
+    // Empty map defaults to map(dyn, dyn)
+    const resultType = mapType(
+      (keyType ?? CelScalar.DYN) as mapKeyType,
+      valueType ?? CelScalar.DYN,
+    );
+
+    this.setType(id, resultType);
+
+    return {
+      id,
+      exprKind: {
+        case: "structExpr",
+        value: {
+          messageName: "",
+          entries,
+        },
+      },
+    };
+  }
+
+  private checkMessageLiteral(
+    id: bigint,
+    struct: Expr_CreateStruct,
+  ): MessageInitShape<typeof ExprSchema> {
+    // Look up the message type
+    const candidates = resolveCandidateNames(
+      this.env.namespace,
+      struct.messageName,
+    );
+
+    let msgType: CelType | undefined = undefined;
+    let resolvedName: string | undefined = undefined;
+
+    for (const candidate of candidates) {
+      const decl = this.env.variables.find(candidate);
+      if (decl) {
+        msgType = decl.type;
+        resolvedName = candidate;
+        break;
+      }
+    }
+
+    if (!msgType || !resolvedName) {
+      throw celError(
+        `undeclared reference to '${struct.messageName}' (in container '${this.env.namespace}')`,
+        id,
+      );
+    }
+
+    if (msgType.kind !== "object") {
+      throw celError(`'${struct.messageName}' is not a message type`, id);
+    }
+
+    if (!msgType.desc) {
+      throw celError(
+        `message type '${struct.messageName}' has no descriptor`,
+        id,
+      );
+    }
+
+    const desc = msgType.desc;
+    const entries: MessageInitShape<
+      typeof ExprSchema
+    >["exprKind"]["value"]["entries"] = [];
+
+    // Check each field entry
+    for (const entry of struct.entries) {
+      if (!entry.keyKind || entry.keyKind.case !== "fieldKey") {
+        throw celError(
+          `message entry must have fieldKey, not mapKey`,
+          entry.id,
+        );
+      }
+
+      const fieldName = entry.keyKind.value;
+      const field = desc.fields.find((f) => f.name === fieldName);
+
+      if (!field) {
+        throw celError(
+          `field '${fieldName}' not found on type '${desc.typeName}'`,
+          entry.id,
+        );
+      }
+
+      // Check value expression
+      if (!entry.value) {
+        throw celError(`message field '${fieldName}' missing value`, entry.id);
+      }
+
+      const valueExpr = this.checkExpr(entry.value);
+      const valueType = this.getExprType(entry.value.id);
+      const expectedType = this.descFieldToCelType(field);
+
+      // Check type assignability
+      if (!this.isAssignable(expectedType, valueType)) {
+        throw celError(
+          `type mismatch: cannot assign ${valueType} to field '${fieldName}' of type ${expectedType}`,
+          entry.id,
+        );
+      }
+
+      entries.push({
+        id: entry.id,
+        keyKind: {
+          case: "fieldKey",
+          value: fieldName,
+        },
+        value: valueExpr,
+        optionalEntry: entry.optionalEntry,
+      });
+    }
+
+    this.setType(id, msgType);
+    this.setReference(id, { name: resolvedName });
+
+    return {
+      id,
+      exprKind: {
+        case: "structExpr",
+        value: {
+          messageName: resolvedName,
+          entries,
         },
       },
     };
