@@ -47,7 +47,6 @@ import { equalsType } from "./equals.js";
 import { NullValue } from "@bufbuild/protobuf/wkt";
 import type { CelEnv } from "./env.js";
 import type { FuncGroup } from "./resolver.js";
-import type { CelFunc } from "./func.js";
 import { resolveCandidateNames } from "./namespace.js";
 import { celError } from "./error.js";
 import { isCelUint } from "./uint.js";
@@ -171,10 +170,7 @@ export class Checker {
     let listElemType: CelType | undefined = undefined;
     for (const elem of listExpr.elements) {
       elements.push(this.checkExpr(elem));
-      const elemType = this.typeMap.get(elem.id);
-      if (!elemType) {
-        throw celError(`element has no type`, elem.id);
-      }
+      const elemType = this.getExprType(elem.id);
       if (listElemType === undefined) {
         listElemType = elemType;
       } else if (!equalsType(listElemType, elemType)) {
@@ -194,6 +190,18 @@ export class Checker {
     };
   }
 
+  /**
+   * Get the type of an expression from the type map.
+   * Throws an error if the type is not found.
+   */
+  private getExprType(id: bigint): CelType {
+    const type = this.typeMap.get(id);
+    if (!type) {
+      throw celError(`expression has no type`, id);
+    }
+    return type;
+  }
+
   private checkCallExpr(
     id: bigint,
     call: Expr_Call,
@@ -203,20 +211,13 @@ export class Checker {
     let targetType: CelType | undefined = undefined;
     if (call.target) {
       target = this.checkExpr(call.target);
-      targetType = this.typeMap.get(call.target.id);
-      if (!targetType) {
-        throw celError(`target has no type`, call.target.id);
-      }
+      targetType = this.getExprType(call.target.id);
     }
     const args: MessageInitShape<typeof ExprSchema>[] = [];
     const argTypes: CelType[] = [];
     for (const arg of call.args) {
       args.push(this.checkExpr(arg));
-      const argType = this.typeMap.get(arg.id);
-      if (!argType) {
-        throw celError(`argument has no type`, arg.id);
-      }
-      argTypes.push(argType);
+      argTypes.push(this.getExprType(arg.id));
     }
     const fnGroup = this.env.funcs.find(fnName);
     if (!fnGroup) {

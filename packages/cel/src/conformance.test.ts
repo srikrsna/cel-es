@@ -31,7 +31,7 @@ const filter = createPathFilter([
   ["type_deductions", "complex_initializers", "struct"],
   ["type_deductions", "field_access"],
   ["type_deductions", "indexing"],
-  ["type_deductions", "functions"],
+  ["type_deductions", "functions", "function_result_type"],
   ["type_deductions", "flexible_type_parameter_assignment", "list_parameter"],
   [
     "type_deductions",
