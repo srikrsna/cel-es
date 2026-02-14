@@ -19,6 +19,7 @@ import type {
   SourceInfo,
   Expr_Ident,
   Expr_CreateList,
+  Expr_Call,
   ConstantSchema,
 } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
 import {
@@ -45,6 +46,8 @@ import {
 import { equalsType } from "./equals.js";
 import { NullValue } from "@bufbuild/protobuf/wkt";
 import type { CelEnv } from "./env.js";
+import type { FuncGroup } from "./resolver.js";
+import type { CelFunc } from "./func.js";
 import { resolveCandidateNames } from "./namespace.js";
 import { celError } from "./error.js";
 import { isCelUint } from "./uint.js";
@@ -83,6 +86,8 @@ export class Checker {
         return this.checkIdentExpr(expr.id, expr.exprKind.value);
       case "listExpr":
         return this.checkListExpr(expr.id, expr.exprKind.value);
+      case "callExpr":
+        return this.checkCallExpr(expr.id, expr.exprKind.value);
       default:
         throw new Error(`Unsupported expression kind: ${expr.exprKind.case}`);
     }
@@ -187,6 +192,131 @@ export class Checker {
         },
       },
     };
+  }
+
+  private checkCallExpr(
+    id: bigint,
+    call: Expr_Call,
+  ): MessageInitShape<typeof ExprSchema> {
+    const fnName = call.function;
+    let target: MessageInitShape<typeof ExprSchema> | undefined = undefined;
+    let targetType: CelType | undefined = undefined;
+    if (call.target) {
+      target = this.checkExpr(call.target);
+      targetType = this.typeMap.get(call.target.id);
+      if (!targetType) {
+        throw celError(`target has no type`, call.target.id);
+      }
+    }
+    const args: MessageInitShape<typeof ExprSchema>[] = [];
+    const argTypes: CelType[] = [];
+    for (const arg of call.args) {
+      args.push(this.checkExpr(arg));
+      const argType = this.typeMap.get(arg.id);
+      if (!argType) {
+        throw celError(`argument has no type`, arg.id);
+      }
+      argTypes.push(argType);
+    }
+    const fnGroup = this.env.funcs.find(fnName);
+    if (!fnGroup) {
+      throw celError(
+        `undeclared reference to '${fnName}' (in container '${this.env.namespace}')`,
+        id,
+      );
+    }
+    const { resultType, overloadIds } = this.resolveOverload(
+      id,
+      fnName,
+      fnGroup,
+      targetType,
+      argTypes,
+    );
+    this.setType(id, resultType);
+    this.setReference(id, functionReference(fnName, overloadIds));
+    return {
+      id,
+      exprKind: {
+        case: "callExpr",
+        value: {
+          target,
+          function: fnName,
+          args,
+        },
+      },
+    };
+  }
+
+  private resolveOverload(
+    id: bigint,
+    fnName: string,
+    fnGroup: FuncGroup,
+    targetType: CelType | undefined,
+    argTypes: CelType[],
+  ): { resultType: CelType; overloadIds: string[] } {
+    const funcs = Array.from(fnGroup);
+    const matchingOverloads: { resultType: CelType; overloadId: string }[] = [];
+    for (const fn of funcs) {
+      const isMethod = fn.target !== undefined;
+      const hasTarget = targetType !== undefined;
+      if (isMethod !== hasTarget) {
+        continue;
+      }
+      let expectedArgs: readonly CelType[];
+      let allArgs: CelType[];
+      if (isMethod && hasTarget && fn.target && targetType) {
+        expectedArgs = [fn.target, ...fn.arguments];
+        allArgs = [targetType, ...argTypes];
+      } else {
+        expectedArgs = fn.arguments;
+        allArgs = argTypes;
+      }
+      if (allArgs.length !== expectedArgs.length) {
+        continue;
+      }
+      let matches = true;
+      for (let i = 0; i < allArgs.length; i++) {
+        if (!this.isAssignable(expectedArgs[i], allArgs[i])) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        matchingOverloads.push({
+          resultType: fn.result,
+          overloadId: fn.id,
+        });
+      }
+    }
+    if (matchingOverloads.length === 0) {
+      const allArgsStr = targetType
+        ? [targetType, ...argTypes].map((t) => t.toString()).join(", ")
+        : argTypes.map((t) => t.toString()).join(", ");
+      throw celError(
+        `no matching overload for '${fnName}' with arguments [${allArgsStr}]`,
+        id,
+      );
+    }
+    if (matchingOverloads.length > 1) {
+      return {
+        resultType: CelScalar.DYN,
+        overloadIds: matchingOverloads.map((o) => o.overloadId),
+      };
+    }
+    return {
+      resultType: matchingOverloads[0].resultType,
+      overloadIds: [matchingOverloads[0].overloadId],
+    };
+  }
+
+  private isAssignable(expected: CelType, actual: CelType): boolean {
+    if (expected.kind === "scalar" && expected.name === "dyn") {
+      return true;
+    }
+    if (actual.kind === "scalar" && actual.name === "dyn") {
+      return true;
+    }
+    return equalsType(expected, actual);
   }
 
   private setType(id: bigint, type: CelType): void {
@@ -404,6 +534,16 @@ function identReference(
   return {
     name,
     value: value ? celValueToProtoConstant(value) : undefined,
+  };
+}
+
+function functionReference(
+  name: string,
+  overloadIds: string[],
+): MessageInitShape<typeof ReferenceSchema> {
+  return {
+    name,
+    overloadId: overloadIds,
   };
 }
 
