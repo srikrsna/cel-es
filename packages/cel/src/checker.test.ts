@@ -20,9 +20,6 @@ import {
 } from "./testing.js";
 
 const filter = createExpressionFilter([
-  "[]",
-  "[1]",
-  '[1, "A"]',
   "fg_s()",
   "is.fi_s_s()",
   "1 + 2",
