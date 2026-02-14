@@ -27,7 +27,6 @@ const filter = createPathFilter([
   ["proto2", "extensions_has"],
   ["proto3", "quoted_fields"],
   // We don't have full support for type-checking.
-  ["type_deductions", "complex_initializers", "map"],
   ["type_deductions", "complex_initializers", "struct"],
   ["type_deductions", "field_access"],
   ["type_deductions", "indexing"],
